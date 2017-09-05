@@ -1,0 +1,133 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: deploy-fluentd
+data:
+  "fluent.conf": |
+    <match fluent.**>
+      type null
+    </match>
+    <source>
+      @type kafka
+      brokers kafka1.local:9092,kafka2.local:9092,kakfa3.local:9092
+      topics _ft_cluster1,_ft_cluster2,_ft_cluster3
+      format json
+      offset "#{ENV['KAFKA_OFFSET']}"
+    </source>
+    <filter *.**>
+      @type record_transformer
+      enable_ruby
+      <record>
+        tv_nsec ${record["time"] ? (record["time"][/.*\.(\d+)Z$/,1] or '').ljust(9, "0") : "000000000"}
+        tv_sec ${record["time"] ? (Time.parse(record["time"]).tv_sec.to_s) : "0000000000"}
+        project ${record["kubernetes"] ? (record["kubernetes"]["namespace_name"] or "_noprj") : "_noprj"}
+        module ${record["kubernetes"] ? (record["kubernetes"]["labels"] ? (record["kubernetes"]["labels"]["MODULE"] or "_nomod") : "_nomod") : "_nomod"}
+        cluster ${tag[4..-1]}
+        pod_name ${record["kubernetes"] ? record["kubernetes"]["pod_name"] : ""}
+        pod_id ${record["kubernetes"] ? record["kubernetes"]["pod_id"] : ""}
+        container ${record["kubernetes"] ? record["kubernetes"]["container_name"] : ""}
+        host ${record["kubernetes"] ? record["kubernetes"]["host"] : ""}
+      </record>
+      remove_keys docker,topic,kubernetes
+    </filter>
+    <filter *.**>
+      @type record_transformer
+      enable_ruby
+      <record>
+        es_id ${record["pod_id"].tr("-","").to_i(16).to_s(36)}${record["container"]}${record["tv_sec"].to_i.to_s(36)}${record["tv_nsec"].to_i.to_s(36)}
+        es_index log-${record["project"]}-${record["module"]}
+        time_ns ${record["tv_nsec"]}
+      </record>
+      remove_keys tv_nsec,tv_sec
+    </filter>
+    <match *.**>
+      @type elasticsearch
+      hosts "#{ENV['ES_HOSTS']}"
+      user fluentd
+      password "#{ENV['ES_FLUENTD_PASSWORD']}"
+      logstash_format true
+      logstash_prefix log
+      write_operation index
+      id_key es_id
+      remove_keys es_id, es_index
+      utc_index false
+      flush_interval 10s
+      disable_retry_limit false
+      retry_limit 30
+      retry_wait  5s
+      max_retry_wait 20s
+      target_index_key es_index
+      type_name fluentd
+      template_name fluentd
+      template_file /fluentd/etc/es_template.json
+      buffer_chunk_limit 64M
+      buffer_queue_limit 32
+    </match>
+  "es_template.json": |
+    {
+      "template" : "log-*",
+      "settings" : {
+         "index.mapper.dynamic": false
+      },
+      "mappings" : {
+        "fluentd": {
+          "dynamic": false,
+          "properties": {
+            "module": { "type": "keyword" },
+            "project": { "type": "keyword" },
+            "cluster": { "type": "keyword" },
+            "container": { "type": "keyword" },
+            "host": { "type": "keyword" },
+            "pod_id": { "type": "keyword" },
+            "pod_name": { "type": "keyword" },
+            "log": { "type": "text" },
+            "stream": {  "type": "keyword" },
+            "time": {  "type": "date"  },
+            "time_ns": { "type": "integer" }
+          }
+        }
+      }
+    }
+---
+apiVersion: apps/v1beta1
+kind: Deployment
+metadata:
+  name: fluentd
+  namespace: bwae
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: fluentd
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        name: fluentd
+    spec:
+      hostNetwork: true
+      volumes:
+      - name: conf
+        configMap:
+          name: deploy-fluentd
+      containers:
+      - name: fluentd
+        image: docker.bwae.org/bwae/fluentd:v1
+        env:
+        - name: KAFKA_OFFSET
+          value: "-1"
+        - name: ES_HOSTS
+          value: http://es1.local:9200,http://es2.local:9200,http://es3.local:9200
+        - name: ES_FLUENTD_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: ES_FLUENTD_PASSWORD
+              name: elasticsearch
+        volumeMounts:
+        - name: conf
+          mountPath: /fluentd/etc

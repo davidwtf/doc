@@ -1,0 +1,105 @@
+---
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1beta1
+metadata:
+  namespace: kube-system
+  name: fluentd
+rules:
+- apiGroups: [""]
+  resources: ["pods", "namespaces"]
+  verbs: ["get", "watch", "list"]
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fluentd
+  namespace: kube-system
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1beta1
+metadata:
+  name: fluentd
+subjects:
+- kind: ServiceAccount
+  name: fluentd
+  namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  name: fluentd
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ds-fluentd
+  namespace: kube-system
+data:
+  "fluent.conf": |
+    <match fluent.**>
+      type null
+    </match>
+    <source>
+      @type tail
+      path /var/log/containers/*.log
+      pos_file /var/log/fluentd/fluentd.pos
+      tag k8s.*
+      format json
+      time_key time
+      time_format %Y-%m-%dT%H:%M:%S.%NZ
+      keep_time_key true
+      read_from_head true
+    </source>
+    <filter k8s.**>
+      @type kubernetes_metadata
+      merge_json_log false
+      kubernetes_url https://k8s.local:6443/api
+    </filter>
+    <match k8s.**>
+      @type kafka_buffered
+      max_send_retries 10
+      required_acks 1
+      compression_codec gzip
+      exclude_topic_key true
+      default_topic _ft_cluster1
+      brokers kafka1.local:9092,kafka2.local:9092,kakfa3.local:9092
+    </match>
+---
+apiVersion: extensions/v1beta1
+kind: DaemonSet
+metadata:
+  name: fluentd
+  namespace: kube-system
+spec:
+  template:
+    metadata:
+      labels:
+        name: fluentd
+    spec:
+      hostNetwork: true
+      serviceAccountName: fluentd
+      volumes:
+      - name: conf
+        configMap:
+          name: ds-fluentd
+      - name: log
+        hostPath:
+          path: /var/log
+      - name: docker
+        hostPath:
+          path: /var/lib/docker/containers
+      containers:
+      - name: fluentd
+        image: docker.bwae.org/bwae/fluentd:v1
+        resources:
+          limits:
+            memory: 200Mi
+          requests:
+            memory: 200Mi
+        volumeMounts:
+        - name: conf
+          mountPath: /fluentd/etc
+        - name: log
+          mountPath: /var/log
+        - name: docker
+          mountPath: /var/lib/docker/containers
+          readOnly: true
