@@ -53,8 +53,6 @@ Fluentd通过Kubernetes的DaemonSet部署，在每个Node节点启动一个Fluen
 - 我们额外配置了kubernetes_url，没有用Kubernetes注入的kubernetes服务的连接信息，这样可以不依赖kube-proxy。
 - kubernetes_url使用了本地域名k8s.local，我们在每个node的/etc/hosts中配置了k8s.local的IP地址，由于我们使用提hostNetwork在容器中可以加载到node的/etc/hosts内容。
 
-Yaml文件内容：
-
 ##  4. 日志传输
 ### a. 写入Kafka中转
 我们使用了Kafka作为日志传输的中转站，原因如下：
@@ -83,3 +81,77 @@ Yaml文件内容：
 Fluentd输出到ES使用ElasticSearch插件完成。我们在使用插件时配置了template_file。Fluentd将在ES中创建一个template，并用这个template创建index。
 ES中通过X-Pack设置了密码和权限，所以此处也需要设置ES的账号和密码。密码存储在Kubernetes的Secret中。
 [Yaml文件](./fluentd_deployment.yaml)供大家参考
+
+##  5. ElasticSearch
+### a. 自定义认证
+
+ES也采用Docker镜像部署，我们发现ES的官方镜像中已经带了x-pack插件（试用版）。x-pack插件中security模块提供了用户认证和授权的功能。我们希望能够做到云平台帐户跟ES的帐户打通。ES支持的认证类型有一种Custom Realm类型。这种类型支持用户自己编写认证插件。ES也提供了认证插件的示例工程。
+
+认证流程如下图所示：
+1. 在ES中安装开发的认证插件。
+2. 在ES的配置项中配置使用插件。
+3. 插件主要实现了两个接口：supports()和authenticate()。
+4. ES首先调用supports()接口，询问插件是否支持当前的token，如果supports()返回true则ES会调用authenticate()完成认证。
+    -  插件会调用云平台的认证接口认证token是否合法。
+    - 未避免云平台的认证接口调用太频繁，插件使用了本地缓存，在认证一次成功后，认证信息进入本地缓存，在一小段时间内不再调用云平台的认证接口。
+    - authenticate()认证通过后返回User对象。User对象包含用户名和角色信息。
+5. 如果supports()接口返回不支持或authenticate()认证失败，ES会尝试配置的下一种认证方法。
+
+![自定义认证流程图](./es.png)
+
+### b. 授权
+
+在authenticate()返回的User对象中的角色（Role）信息包含两个角色：base和与用户名同名的角色。base角色包含了基础授权比如对.kibana的授权。与用户名同名的角色，由云平台调用x-pack的接口创建，指名当前用户可以访问哪些indice。
+
+### c. 配置
+
+关于x-pack的配置如下，我们只需要x-pack的安全功能，把其它功能关闭，并配置了自定义认证和原生认证同时生效，但自定义认证的优先级更高。
+
+```
+xpack.monitoring.enabled: false
+xpack.watcher.enabled: false
+xpack.ml.enabled: false
+xpack.security.authc:
+  realms:
+    custom:
+      type: bwae
+      order: 0
+      checkURL: ${BWAE_REALM_CHECK_URL}
+    native:
+      type: native
+      order: 100
+```
+##  6. Kibana
+### a. 镜像制作
+
+官方给的Kibana镜像 **docker.elastic.co/kibana/kibana:5.4.3** 也是带x-pack的，我们只需要x-pack的security功能，所以我们在配置中把x-pack的其它功能禁用：
+```
+xpack.monitoring.enabled: false
+xpack.watcher.enabled: false
+xpack.reporting.enabled: false
+xpack.ml.enabled: false
+```
+Kibana在第一次启动时会做一些优化工作，优化时间通常需要几分钟，这一点与云原生的"快速启动"原则是相违背的。因此需要把优化的结果也写入到镜像中。我们使用的一个技巧是：先占用Kibana的默认端口5601，再启动Kibana，等Kibana完成优化真正运行时发现端口占用，自然就退出了，但优化的结果保存在了镜像中。具体的Dockerfile如下：
+
+```
+FROM docker.elastic.co/kibana/kibana:5.4.3
+USER root
+RUN yum update -y && yum install -y nc && yum clean all
+USER kibana
+COPY kibana.yml /usr/share/kibana/config/
+RUN (nc -l 5601 &) && (kibana 2>&1; exit 0)
+```
+### b. 登录认证
+
+查看Kibana的源码后我们发现：
+1. Kibana本身不做认证，它的认证都是调用ES的认证接口
+2. Kibana有两处登录方式：基于Cookie的和Basic Auth
+
+我们采用Basic Auth配合nginx打通Kibana和云平台之间的认证，主要流程如下图所示：
+1. 云平台生成一个访问Kibana的带认证token的URL，形如http://kibana....com?auth=xxxxx
+2. auth的值是通常当前用户sessionId加密后得到。（加密算法不重要，因为解密也是在云平台中完成。加密的目的只是避免sessionId泄露。）
+3. 使用nginx反向代理Kibana。
+4. nginx先把auth=xxxx写入到cookie中。
+5. 后面的每次请求，nginx从cookie中读出auth，然后写入Basic Auth认证信息。
+6. Kibana也使用Basic Auth向ES认证，而ES中配置的认证插件会向云平台验证auth的值，验证通过后云平台将返回登录的用户名。
+
