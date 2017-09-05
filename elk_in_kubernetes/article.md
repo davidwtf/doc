@@ -147,11 +147,49 @@ RUN (nc -l 5601 &) && (kibana 2>&1; exit 0)
 1. Kibana本身不做认证，它的认证都是调用ES的认证接口
 2. Kibana有两处登录方式：基于Cookie的和Basic Auth
 
-我们采用Basic Auth配合nginx打通Kibana和云平台之间的认证，主要流程如下图所示：
-1. 云平台生成一个访问Kibana的带认证token的URL，形如http://kibana....com?auth=xxxxx
+我们采用Basic Auth配合nginx打通Kibana和云平台之间的认证，主要流程如下图所示, [nginx配置](./nginx.conf)供大家参考。
+1. 云平台生成一个访问Kibana的带认证token的URL，形如http://kibana_url/custom?auth=xxxxx
 2. auth的值是通常当前用户sessionId加密后得到。（加密算法不重要，因为解密也是在云平台中完成。加密的目的只是避免sessionId泄露。）
 3. 使用nginx反向代理Kibana。
 4. nginx先把auth=xxxx写入到cookie中。
 5. 后面的每次请求，nginx从cookie中读出auth，然后写入Basic Auth认证信息。
 6. Kibana也使用Basic Auth向ES认证，而ES中配置的认证插件会向云平台验证auth的值，验证通过后云平台将返回登录的用户名。
+
+![Kibana登录认证流程图](./kibana.png)
+
+## 7. 基它问题
+### a. Kafka安全性
+
+因为异地集群会通过公网连接Kafka，为提供Kafka的安全性，为Kafka配置了证书方式的认证和加密。具体可参考[Kafka的官方网站](https://kafka.apache.org/documentation/#security_ssl)。
+
+### b. ES的数据清理
+
+太久远的历史日志会占用大量的存储空间，而且尤其是开发测试环境中的历史日志意义不大。我们希望对特定Indice的内容做清理。可以通过调用ES的_delete_by_query接口完成，调用示例如下。可以配合使用定时脚本实现定时清理。
+```
+url -XPOST  -H 'Authorization: Basic *****' '127.0.0.1:9200/log-cluster1-*/_delete_by_query' -d '
+ {  
+     "query": {
+         "range": {
+             "time" : {
+                 "lte": "2017-08-14",
+                 "format": "yyyy-MM-dd" 
+              }
+         }
+     }
+ }'
+```
+### c. ES的x-pack试用到期的问题
+
+官方镜像中x-pack中有一个月的试用期，到期后将不能正常登录。到期后可以考虑购买正式的Lincese，或者使用如下办法延长试用期。
+删除所有ES节点的数据目录下的_state/global-x.st文件，重启ES集群，将重新获得一个月的试用期
+
+### d. 日志丢失和重新采集
+
+由于进入ES的每条日志都有唯一的文档Id，重新采集日志也不会在ES中不会重复。
+如果日志没有写入到Kafka，可以删除Fluentd的pos文件，重启Fluentd容器，重新采集容器日志，此时Kafka中的日志将可能重复。
+如果日志已写入Kafka，但没写入ES，可以额外启动一个Fluentd重新从Kafka拉取日志写入ES。
+
+### e. fluentbit
+
+fluentbit使用C语言开发，是比fluentd更轻量的日志采集端，但插件较少。我们正在考虑开发fluentbit的kafka客户端，将来用fluentbit替换fluentd
 
