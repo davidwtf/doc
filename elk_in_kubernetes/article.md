@@ -35,8 +35,8 @@
 ### b. Kubernetes日志与Docker日志的关系
 
 如果Docker配置的是json-file日志驱动，那么kubelet在启动容器时，会同时创建一个符号链接到Docker容器的日志文件。
-kubernetes的日志文件默认存储在 **/var/log/containers/** 目录下，以<pod名>_<namespace>_<container名>_<container Id>.log命名。
-这个文件是一个符号链接，链接到Docker容器的日志文件。Docker日志文件默认在 **/var/lib/docker/containers/<container Id>/** 目录下，以<container Id>-json.log命名。fluentd可以用tail模块监视/var/log/containers/目录，收集此目录下的文件内容。
+kubernetes的日志文件默认存储在 **/var/log/containers/** 目录下，以pod名_namespace_container名_containerId.log命名。
+这个文件是一个符号链接，链接到Docker容器的日志文件。Docker日志文件默认在 **/var/lib/docker/containers/containerId/** 目录下，以containerId-json.log命名。fluentd可以监视 **/var/log/containers/** 目录，收集此目录下的文件内容。
 
 ### c. kuberntetes_metadata_filter插件的工作原理
 
@@ -44,7 +44,7 @@ fluentd的kubernetes_metadata_filter插件通过分析/var/log/conatiners/目录
 
 ### d.  Fluentd的部署
 
-Fluentd通过Kubernetes的DaemonSet部署，在每个Node节点启动一个Fluentd Pod收集本节点的Pod日志。下面的Yaml文件供大家参考。有几点说明：
+Fluentd通过Kubernetes的DaemonSet部署，在每个Node节点启动一个Fluentd Pod收集本节点的Pod日志。[Yaml文件](./fluentd_daemonset.yaml)供大家参考。有几点说明：
 - 因为我们的Kubernetes集群启用了RBAC，所以要为Fluentd配置权限。我们创建了名为fluentd的ServiceAccount、ClusterRole和ClusterRoleBinding。
 - 目前Fluentd的配置存储在ConfigMap中，通过Volume挂载入容器，将来计划将固定的配置直接写入fluentd的镜像。
 - Fluentd需要把主机的/var/lib/docker/containers和/var/log两个目录挂载入容器中。
@@ -52,3 +52,34 @@ Fluentd通过Kubernetes的DaemonSet部署，在每个Node节点启动一个Fluen
 - Fluentd并不需要容器网络，所以使用了hostNetwork
 - 我们额外配置了kubernetes_url，没有用Kubernetes注入的kubernetes服务的连接信息，这样可以不依赖kube-proxy。
 - kubernetes_url使用了本地域名k8s.local，我们在每个node的/etc/hosts中配置了k8s.local的IP地址，由于我们使用提hostNetwork在容器中可以加载到node的/etc/hosts内容。
+
+Yaml文件内容：
+
+##  4. 日志传输
+### a. 写入Kafka中转
+我们使用了Kafka作为日志传输的中转站，原因如下：
+- 虽然Fluentd可以直接将日志写入ES，但我们担心如果ES的写入速度过慢可能会造成日志堆积，毕竟Fluentd的本地缓存有限。
+- 我们有异地的Kubernetes集群需要通过公网传输日志，Kafka的日志压缩功能可以减少公网传输量。
+- 在日志存入ES前，我们希望对日志做进一步的加工。
+
+综上所述，我们在日志分析侧设置了Kafka，各Kubernetes集群的日志由Fluentd发送到Kafka，每个Kubernetes使用同一个topic发送日志到Kafka。
+
+### b. 从Kafka拉取日志
+
+从Kakfa拉取日志并写入到ES，我们同样使用了Fluentd完成。这得益于Fluentd丰富的插件。我们的日志分析侧同样是部署在一个Kubernetes集群中。从Kafka拉取日志的Fluentd以Deployment的方式部署。
+
+### c. 日志转换
+
+采集到Kafka的日志以Kubernetes视角来观察的，但并不完全符合用户的视角。我们想在日志写入ES前做进一步转换。我们通过Fluentd的record_transformer插件完成转换。我们做了如下转换：
+- 提取项目和模块信息，我们是以项目和模块两级管理用户Pod的，项目对应Kubernetes的namespace，而模块是在Pod的labels中用MODULE标签标识。
+- 提取集群名称，集群名称从Kafka的topic中提取。
+- Pod的元数据保留下Pod的名称、Pod的Id、容器名和主机名，其它的清除。
+- 时间转换，从原始的日志时间中提取出纳秒。因为ES的时间精度只能到毫秒，但日志中的时间精度到纳秒。
+- 生成ES的文档Id，文档Id以pod id+容器名+秒+纳秒生成，为减小文档Id长度，其中的可数字化部分转成36进制的字符串表示。可以保证每条日志的文档Id都不同，可以实现日志重新采集后内容不重复.
+- 生成ES的index，以log-项目名-模块名表示。
+
+### d. 输出到ES
+
+Fluentd输出到ES使用ElasticSearch插件完成。我们在使用插件时配置了template_file。Fluentd将在ES中创建一个template，并用这个template创建index。
+ES中通过X-Pack设置了密码和权限，所以此处也需要设置ES的账号和密码。密码存储在Kubernetes的Secret中。
+[Yaml文件](./fluentd_deployment.yaml)供大家参考
