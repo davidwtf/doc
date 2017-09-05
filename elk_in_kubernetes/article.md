@@ -108,6 +108,7 @@ ES也采用Docker镜像部署，我们发现ES的官方镜像中已经带了x-pa
 关于x-pack的配置如下，我们只需要x-pack的安全功能，把其它功能关闭，并配置了自定义认证和原生认证同时生效，但自定义认证的优先级更高。
 
 ```
+# elasticsearch.yml
 xpack.monitoring.enabled: false
 xpack.watcher.enabled: false
 xpack.ml.enabled: false
@@ -126,6 +127,7 @@ xpack.security.authc:
 
 官方给的Kibana镜像 **docker.elastic.co/kibana/kibana:5.4.3** 也是带x-pack的，我们只需要x-pack的security功能，所以我们在配置中把x-pack的其它功能禁用：
 ```
+# kibana.yml
 xpack.monitoring.enabled: false
 xpack.watcher.enabled: false
 xpack.reporting.enabled: false
