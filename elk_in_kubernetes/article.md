@@ -2,35 +2,35 @@
 ##  1. 概述
 
 企业中常用的日志系统莫过于ELK，即Elasticsearch（简称ES）、Logstash和Kibana。
-- Logstash：负责收集日志
-- Elasticsearch：负责日志的存储和检索
+- Logstash：负责收集日志;
+- Elasticsearch：负责日志的存储和检索;
 - Kibana：向用户提供查询和显示的操作界面。
 
-由于Logstash是用JRuby开发的，需要JVM才能运行，作为日志采集器显得有些庞大。因此我们把Logstash换成了Fluentd。Fluentd是用ruby开发的，内存开销只有Logstash的十分之一，而且有很多插件，方便与其它工具集成。最关键的Fluentd有一个**kubernetes_metadata_filter**的插件可以在原始的日志内容上附加kubernetes的信息。
+由于Logstash是用JRuby开发的，需要JVM才能运行，作为日志采集器显得有些庞大。因此我们把Logstash换成了Fluentd。Fluentd是用ruby开发的，内存开销只有Logstash的十分之一，而且有很多插件，方便与其它工具集成。最关键的Fluentd的**kubernetes_metadata_filter**插件可以在日志内容上附加kubernetes的Pod信息。
 
 本文介绍了在多个kubernetes集群中收集日志的方案，涉及到日志的采集，传送，存储，认证和授权等方面的内容。
 
 ##  2. 总体架构
 
 如下图所示，日志系统由两部分组成：**日志采集**和**日志分析**。
-- 日志采集：运行于Kubernetes集群内部，通过DaemonSet的方式收集每个Node上的日志。
-- 日志分析：可以独立于Kubernetes集群之外，通过Kafka收集Fluentd采集的各Node上的日志。
+- 日志采集：运行于Kubernetes集群内部，通过DaemonSet的方式部署Fluentd，收集每个Node上的日志。
+- 日志分析：可以独立于要监控的Kubernetes集群之外，通过Kafka收集Fluentd采集的各Node上的日志。
 
-目前，我们的架构中，有多个Kubernetes集群，各集群的日志都发到同一个日志分析模块。
+目前，我们的架构中，有多个Kubernetes集群，各集群的日志都发送到同一个日志分析系统。
 ![架构图](./arch.png)
 
 ##  3. 日志采集
 ### a. Docker日志驱动的选择
 
-日志采集通过Fluentd从Docker容器中收集日志。Docker有几种日志驱动可以用于Fluentd收集日志：
+Docker有几种日志驱动可以用于Fluentd收集日志：
 - json-file：容器日志以json格式写进文件，fluentd用tail收集。
 - syslog：fluentd以syslog方式收集，容器日志发送给fluentd打开的syslog监听端口。
 - journald：容器日志写入journald，fluentd安装systemd插件，收集journald的日志。
 - fluentd：容器日志直接发送给fluentd，fluentd以forward方式打开监听，接收容器日志。
 
-我们不但要收集容器的日志，还要使用fluentd的kubernetes_metadata_filter插件在日志上附加上Kubernetes的元数据。kubernetes_metadata_filter只支持journald和json-file两种驱动，所以我们的选择范围也就集中到这两种方式上。另外，docker logs命令也只支持json-file和journald两种试，如果配置成其它驱动方式，将不能使用docker logs命令。
+我们不但要收集容器的日志，还要使用kubernetes_metadata_filter插件。kubernetes_metadata_filter只支持journald和json-file两种驱动，所以我们的选择范围也就集中到这两种方式上。另外，docker logs命令也只支持json-file和journald，如果配置成其它驱动方式，将不能使用docker logs命令。
 
-最终我们选择了json-file驱动，这也是Docker的默认驱动，我们比较熟悉。json-file还可以通过log-opts设置每个容器的日志文件的大小和数量，方便预留日志存储空间。fluentd自带的tail模块就可以收集日志文件，如果用journald，还需要为fluentd额外安装插件。
+最终我们选择了json-file驱动，这也是Docker的默认驱动，我们比较熟悉。json-file还可以通过log-opts设置每个容器的日志文件的大小和数量，方便预留日志存储空间。Fluentd用自带的tail模块就可以收集json-file日志文件，如果用journald，还需要为Fluentd额外安装插件。
 
 ### b. Kubernetes日志与Docker日志的关系
 
@@ -45,22 +45,23 @@ fluentd的kubernetes_metadata_filter插件通过分析/var/log/conatiners/目录
 ### d.  Fluentd的部署
 
 Fluentd通过Kubernetes的DaemonSet部署，在每个Node节点启动一个Fluentd Pod收集本节点的Pod日志。[Yaml文件](./fluentd_daemonset.yaml)供大家参考。有几点说明：
-- 因为我们的Kubernetes集群启用了RBAC，所以要为Fluentd配置权限。我们创建了名为fluentd的ServiceAccount、ClusterRole和ClusterRoleBinding。
-- 目前Fluentd的配置存储在ConfigMap中，通过Volume挂载入容器，将来计划将固定的配置直接写入fluentd的镜像。
+- 如果Kubernetes集群启用了RBAC，所以要为Fluentd配置权限。示例的[Yaml文件](./fluentd_daemonset.yaml中，我们创建了名为fluentd的ServiceAccount、ClusterRole和ClusterRoleBinding。
+- 目前Fluentd的配置存储在ConfigMap中，通过Volume挂载入容器，将来计划将固定的配置直接写入Fluentd的镜像。
 - Fluentd需要把主机的/var/lib/docker/containers和/var/log两个目录挂载入容器中。
 - 关于Fluentd镜像，现阶段只是在官方v0.12版本镜像的基础上增加了所需的插件，并且以root用户运行，因为/var/lib/docker/containters下的内容只能是root用户才能读取。
 - Fluentd并不需要容器网络，所以使用了hostNetwork
 - 我们额外配置了kubernetes_url，没有用Kubernetes注入的kubernetes服务的连接信息，这样可以不依赖kube-proxy。
-- kubernetes_url使用了本地域名k8s.local，我们在每个node的/etc/hosts中配置了k8s.local的IP地址，由于我们使用提hostNetwork在容器中可以加载到node的/etc/hosts内容。
+- kubernetes_url使用了本地域名k8s.local，我们在每个node的/etc/hosts中配置了k8s.local的IP地址，由于我们使用提hostNetwork网络，所以在容器中可以加载到宿主的/etc/hosts内容。
 
 ##  4. 日志传输
 ### a. 写入Kafka中转
+
 我们使用了Kafka作为日志传输的中转站，原因如下：
 - 虽然Fluentd可以直接将日志写入ES，但我们担心如果ES的写入速度过慢可能会造成日志堆积，毕竟Fluentd的本地缓存有限。
 - 我们有异地的Kubernetes集群需要通过公网传输日志，Kafka的日志压缩功能可以减少公网传输量。
 - 在日志存入ES前，我们希望对日志做进一步的加工。
 
-综上所述，我们在日志分析侧设置了Kafka，各Kubernetes集群的日志由Fluentd发送到Kafka，每个Kubernetes使用同一个topic发送日志到Kafka。
+综上所述，我们在日志分析侧设置了Kafka，各Kubernetes集群的日志由Fluentd发送到Kafka，每个Kubernetes集群使用同一个topic发送日志到Kafka。
 
 ### b. 从Kafka拉取日志
 
@@ -68,7 +69,7 @@ Fluentd通过Kubernetes的DaemonSet部署，在每个Node节点启动一个Fluen
 
 ### c. 日志转换
 
-采集到Kafka的日志以Kubernetes视角来观察的，但并不完全符合用户的视角。我们想在日志写入ES前做进一步转换。我们通过Fluentd的record_transformer插件完成转换。我们做了如下转换：
+采集到Kafka的日志以Kubernetes视角来观察的，并不完全符合用户的视角。我们想在日志写入ES前做进一步转换。我们通过Fluentd的record_transformer插件完成转换。我们做了如下转换：
 - 提取项目和模块信息，我们是以项目和模块两级管理用户Pod的，项目对应Kubernetes的namespace，而模块是在Pod的labels中用MODULE标签标识。
 - 提取集群名称，集群名称从Kafka的topic中提取。
 - Pod的元数据保留下Pod的名称、Pod的Id、容器名和主机名，其它的清除。
@@ -89,12 +90,12 @@ ES也采用Docker镜像部署，我们发现ES的官方镜像中已经带了x-pa
 
 认证流程如下图所示：
 1. 在ES中安装开发的认证插件。
-2. 在ES的配置项中配置使用插件。
+2. 在ES的配置项中配置使用认证插件。
 3. 插件主要实现了两个接口：supports()和authenticate()。
 4. ES首先调用supports()接口，询问插件是否支持当前的token，如果supports()返回true则ES会调用authenticate()完成认证。
-    -  插件会调用云平台的认证接口认证token是否合法。
-    - 未避免云平台的认证接口调用太频繁，插件使用了本地缓存，在认证一次成功后，认证信息进入本地缓存，在一小段时间内不再调用云平台的认证接口。
-    - authenticate()认证通过后返回User对象。User对象包含用户名和角色信息。
+    - 插件会调用云平台的认证接口认证token是否合法。
+    - 未避免云平台的认证接口调用太频繁，认证插件使用了本地缓存，在认证一次成功后，认证信息进入本地缓存，在一小段时间内不再调用云平台的认证接口。
+    - authenticate()认证通过后返回User对象。User对象包含用户名和角色。
 5. 如果supports()接口返回不支持或authenticate()认证失败，ES会尝试配置的下一种认证方法。
 
 ![自定义认证流程图](./es.png)
@@ -133,7 +134,7 @@ xpack.watcher.enabled: false
 xpack.reporting.enabled: false
 xpack.ml.enabled: false
 ```
-Kibana在第一次启动时会做一些优化工作，优化时间通常需要几分钟，这一点与云原生的"快速启动"原则是相违背的。因此需要把优化的结果也写入到镜像中。我们使用的一个技巧是：先占用Kibana的默认端口5601，再启动Kibana，等Kibana完成优化真正运行时发现端口占用，自然就退出了，但优化的结果保存在了镜像中。具体的Dockerfile如下：
+Kibana在第一次启动时会做一些优化工作，优化时间通常需要几分钟，这一点与云原生的"快速启动"原则是相违背的。因此需要把优化的结果也写入到镜像中。我们在Dockerfile中使用了一个技巧：先占用Kibana的默认端口5601，再启动Kibana，等Kibana完成优化真正运行时发现端口占用，自然就退出了，但优化的结果保存在了镜像中。具体的Dockerfile如下：
 
 ```
 FROM docker.elastic.co/kibana/kibana:5.4.3
@@ -151,7 +152,7 @@ RUN (nc -l 5601 &) && (kibana 2>&1; exit 0)
 
 我们采用Basic Auth配合nginx打通Kibana和云平台之间的认证，主要流程如下图所示, [nginx配置](./nginx.conf)供大家参考。
 1. 云平台生成一个访问Kibana的带认证token的URL，形如http://kibana_url/custom?auth=xxxxx
-2. auth的值是通常当前用户sessionId加密后得到。（加密算法不重要，因为解密也是在云平台中完成。加密的目的只是避免sessionId泄露。）
+2. auth的值是通常当前用户sessionId加密后得到。（加密算法不重要，因为解密也是在云平台中完成。加密的目的是避免sessionId泄露。）
 3. 使用nginx反向代理Kibana。
 4. nginx先把auth=xxxx写入到cookie中。
 5. 后面的每次请求，nginx从cookie中读出auth，然后写入Basic Auth认证信息。
@@ -166,7 +167,7 @@ RUN (nc -l 5601 &) && (kibana 2>&1; exit 0)
 
 ### b. ES的数据清理
 
-太久远的历史日志会占用大量的存储空间，而且尤其是开发测试环境中的历史日志意义不大。我们希望对特定Indice的内容做清理。可以通过调用ES的_delete_by_query接口完成，调用示例如下。可以配合使用定时脚本实现定时清理。
+太久远的历史日志会占用大量的存储空间，尤其是开发测试环境中的历史日志意义不大。我们希望对特定Indice的内容按时间做清理。这个需求可以通过调用ES的_delete_by_query接口达到。调用示例如下，可以配合定时脚本实现定时清理。
 ```
 url -XPOST  -H 'Authorization: Basic *****' '127.0.0.1:9200/log-cluster1-*/_delete_by_query' -d '
  {  
@@ -188,10 +189,10 @@ url -XPOST  -H 'Authorization: Basic *****' '127.0.0.1:9200/log-cluster1-*/_dele
 ### d. 日志丢失和重新采集
 
 由于进入ES的每条日志都有唯一的文档Id，重新采集日志也不会在ES中不会重复。
-如果日志没有写入到Kafka，可以删除Fluentd的pos文件，重启Fluentd容器，重新采集容器日志，此时Kafka中的日志将可能重复。
-如果日志已写入Kafka，但没写入ES，可以额外启动一个Fluentd重新从Kafka拉取日志写入ES。
+- 如果日志没有写入到Kafka，可以删除Fluentd的pos文件，重启Fluentd容器，重新采集容器日志，此时Kafka中的日志将可能重复。
+- 如果日志已写入Kafka，但没写入ES，可以额外启动一个Fluentd重新从Kafka拉取日志写入ES。
 
 ### e. fluentbit
 
-fluentbit使用C语言开发，是比fluentd更轻量的日志采集端，但插件较少。我们正在考虑开发fluentbit的kafka客户端，将来用fluentbit替换fluentd
+fluentbit使用C语言开发，是比fluentd更轻量的日志采集端，但插件较少。我们正在考虑开发fluentbit的kafka插件，将来用fluentbit替换fluentd
 
